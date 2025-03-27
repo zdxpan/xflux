@@ -14,6 +14,7 @@ import random
 import math, cv2
 import gradio as gr
 from gradio_imageslider import ImageSlider
+
 from diffusers import StableDiffusion3Pipeline, StableDiffusion3Img2ImgPipeline
 from diffusers import StableDiffusion3Img2ImgPipeline
 from diffusers.models import SD3Transformer2DModel
@@ -30,7 +31,8 @@ import matplotlib.pyplot as plt
 
 from clip_inter_rogator import ClipInterrogator
 from ttp_tile import concatenate_columnwise, concatenate_rowwise, tensor2pil, pil2tensor
-
+from ttp_tile import TTP
+from diffusers.utils import make_image_grid
 
 dtype=torch.bfloat16
 device = "cuda"
@@ -381,24 +383,39 @@ if 0:
 
 # @spaces.GPU
 @timer_func
-def gradio_process_image(input_image, resolution, num_inference_steps, strength, hdr, guidance_scale, controlnet_strength, scheduler_name, is_turbo):
+def gradio_process_image(input_image, resolution, steps, strength, hdr, 
+    tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
+    guidance_scale, controlnet_strength, scheduler_name, is_turbo):
     statistical_runtime.reset_collection()
 
     print("Starting image processing...")
     OVERLAP = 64
-    # 3840, "height": 2304,
-    resolution = 3840
-    TILE_SIZE = 1280
-    tile_width = 3840 // 2 + OVERLAP
-    tile_height = 2304 // 2 + OVERLAP
-
+    tile_processor = TTP()
     condition_image = prepare_image(input_image, resolution, hdr)
     # condition_image = resize_and_upscale(condition_image, resolution)   # make sure 64  can diffusion
     input_image = condition_image
     W, H = condition_image.size
-
-
-    bbox_list, weight, cols, rows = split_bboxes(W, H, tile_width, tile_height, OVERLAP)
+    # 3840, "height": 2304,
+    if 1:
+        # resolution = 3840
+        TILE_SIZE = 1280
+        tile_width = W // 2 + OVERLAP
+        tile_height = H // 2 + OVERLAP
+        bbox_list, weight, cols, rows = split_bboxes(W, H, tile_width, tile_height, OVERLAP)  # 不能均等切割~
+    elif 0:  # no same tile 
+        tile_width, tile_height = adaptive_tile_size((W, H), base_tile_size=1280, max_tile_size=1920)  # max_tile_size=1920
+        bbox_list, weight, cols, rows = split_bboxes(W, H, tile_width, tile_height, OVERLAP)  # 不能均等切割~
+    elif 0:
+        # way || TTP tile v2
+        #  ttplant tile v2: image 3840,2880
+        height_scale = tile_rows
+        width_scale = tile_cols
+        tile_width, tile_height = tile_processor.image_width_height(input_image, width_scale, height_scale, OVERLAP)   #  
+        bbox_list, (num_cols, num_rows) = tile_processor.tile_image(input_image, tile_width, tile_height)
+        cols, rows = num_cols, num_rows
+        # for tile_box in box_tiles:
+        #     tile_im = image.crop(tile_box.box)
+    print(f'>> tile_width, tile_height: {tile_width, tile_height}')
 
     for bbox in bbox_list:
         left, top, right, bottom = bbox.box
@@ -407,7 +424,7 @@ def gradio_process_image(input_image, resolution, num_inference_steps, strength,
         # bbox.prompt = generate_llm('describe this image in English', tile, model='qwen-vl-plus')
         res = clip_rogator.run(image=tile, prompt_mode='fast', image_analysis='off')
         bbox.prompt = res['result'][0][0]
-        print(f'>> tile {(left, top, right, bottom)} size {tile_w, tile_h} prompt:{len(bbox.prompt)}')
+        print(f'>> __tile__ {(left, top, right, bottom)} size {tile_w, tile_h} prompt:{len(bbox.prompt)}')
 
     result = np.zeros((H, W, 3), dtype=np.float32)
     result_list = []
@@ -432,14 +449,14 @@ def gradio_process_image(input_image, resolution, num_inference_steps, strength,
                         prompt=bbox.prompt,height=tile_height, width=tile_width, num_inference_steps=num_inference_steps, 
                         image=tile, strength=strength, guidance_scale=guidance_scale).images[0]
                 else:
-                    steps = 20
+                    steps = steps
                     sigmas=np.linspace(1.0, 1 / steps, steps)
                     mult_sgma = MultiplySigmas()
-                    sigmas=mult_sgma.simple_output(sigmas, 0.9, 0.1, 0.9)
+                    sigmas=mult_sgma.simple_output(sigmas, sigma_scale, sigma_start, sigma_end)
                     args = {
                         "prompt": bbox.prompt, "resizer": 'crop_middle', "steps": steps, "n_samples": 1,
                         "tile_percent": 0, "enable_tile": False, "new_tile": False,   # 启用分块放大算法~
-                        "width": tile_width, "height": tile_height,  "file": [tile], "image": 0,  "strength": 0.55, 'sigmas': sigmas,
+                        "width": tile_width, "height": tile_height,  "file": [tile], "image": 0,  "strength": strength, 'sigmas': sigmas,
                         "mask": None,  "scale": 3.5, "seed": [-1], "variant": 0.0, "variant_seed": [-1],
                     }
                     default_template.update(args)
@@ -457,6 +474,10 @@ def gradio_process_image(input_image, resolution, num_inference_steps, strength,
             weight_sum[top:bottom, left:right] += tile_weight[:, :, np.newaxis]
     
     # Normal liner result WAY |
+    debug_im = make_image_grid(
+        result_list, cols=cols, rows=rows
+    )
+    debug_im.save('/home/dell/workspace/js-ai-svc/src/xflux/1_debug_tile_neeTTP_.png')
     result_list = [pil2tensor(im_).permute(0, 3, 1,2) for im_ in result_list]
     result_list = [
         result_list[i: i + cols] for i in range(0, len(result_list), cols)
@@ -476,12 +497,12 @@ def gradio_process_image(input_image, resolution, num_inference_steps, strength,
         input_image = Image.fromarray(input_image)
     output_pil = Image.fromarray(final_result)
     print("Image processing completed successfully")
-    stitched_image.save('/home/dell/workspace/js-ai-svc/src/xflux/1_test_fluxe_outer_tile.jpeg')
     return gr.update(value = [input_image,stitched_image]), gr.update(value=stitched_image)
 
 
 if __name__ == "__main__":
-    title = """<h1 align="center">Tile Upscaler V3 flux.1 pp </h1>
+    title = """<h1 align="center">Tile Upscaler V3 flux.1 pp sd3 </h1>"""
+    """
     <p align="center">Creative version of Tile Upscaler. The main ideas come from</p>
     <p><center>
     <a href="https://huggingface.co/spaces/gokaygokay/Tile-Upscaler" target="_blank">[Tile Upscaler]</a>
@@ -493,33 +514,55 @@ if __name__ == "__main__":
     with gr.Blocks() as demo:
         gr.HTML(title)
         with gr.Row():
-            with gr.Column():
+            with gr.Column(scale=2):
                 input_image = gr.Image(type="pil", label="Input Image")
                 run_button = gr.Button("Enhance Image")
-            with gr.Column():
-                output_slider = ImageSlider(label="Before / After", type="numpy")
-            with gr.Column():
+                with gr.Row():
+                    resolution = gr.Slider(minimum=128, maximum=4096, value=3840, step=128, label="Resolution Mx len")
+                    num_inference_steps = gr.Slider(minimum=1, maximum=50, value=16, step=1, label="Steps")
+                with gr.Row():
+                    strength = gr.Slider(minimum=0, maximum=1, value=0.2, step=0.01, label="Strength")
+                    hdr = gr.Slider(minimum=0, maximum=1, value=0, step=0.1, label="HDR Effect")
+                with gr.Accordion("Advanced Options", open=False):
+                    with gr.Row():
+                        tile_rows = gr.Slider(minimum=1, maximum=4, value=2, step=1, label="tile Rows")
+                        tile_cols = gr.Slider(minimum=1, maximum=4, value=2, step=1, label="tile Cols")
+                    with gr.Row():
+                        sigma_scale = gr.Slider(minimum=0.8, maximum=2.0, value=1, step=0.05, label="sigma-scale")
+                        sigma_start = gr.Slider(minimum=0.0, maximum=0.8, value=0.1, step=0.05, label="sigma-start")
+                        sigma_end = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="sigma-end")
+                    with gr.Row():
+                        is_turbo = gr.Checkbox(label='speed_turbo only 4 sd3', value=False)
+                        guidance_scale = gr.Slider(minimum=0, maximum=20, value=6, step=0.5, label="Guidance Scale")
+                    controlnet_strength = gr.Slider(minimum=0.0, maximum=2.0, value=0.75, step=0.05, label="ControlNet Strength only 4 sd1.5")
+                    scheduler_name = gr.Dropdown(
+                        choices=["DDIM", "DPM++ 3M SDE Karras", "DPM++ 3M Karras"],
+                        value="DDIM",
+                        label="Scheduler"
+                    )
+
+            with gr.Column(scale=3):
                 output_image = gr.Image(label="After", type="numpy")
-        with gr.Accordion("Advanced Options", open=False):
-            with gr.Row():
-                resolution = gr.Slider(minimum=128, maximum=4096, value=1280, step=128, label="Resolution")
-                num_inference_steps = gr.Slider(minimum=1, maximum=50, value=8, step=1, label="Number of Inference Steps")
-            with gr.Row():
-                strength = gr.Slider(minimum=0, maximum=1, value=0.2, step=0.01, label="Strength")
-                hdr = gr.Slider(minimum=0, maximum=1, value=0, step=0.1, label="HDR Effect")
-            with gr.Row():
-                is_turbo = gr.Checkbox(label='speed_turbo', value=False)
-                guidance_scale = gr.Slider(minimum=0, maximum=20, value=6, step=0.5, label="Guidance Scale")
-            controlnet_strength = gr.Slider(minimum=0.0, maximum=2.0, value=0.75, step=0.05, label="ControlNet Strength")
-            scheduler_name = gr.Dropdown(
-                choices=["DDIM", "DPM++ 3M SDE Karras", "DPM++ 3M Karras"],
-                value="DDIM",
-                label="Scheduler"
-            )
+                output_slider = ImageSlider(label="Before / After", type="numpy")
+                # with gr.Column():
 
         run_button.click(fn=gradio_process_image, 
-                        inputs=[input_image, resolution, num_inference_steps, strength, hdr, guidance_scale, controlnet_strength, scheduler_name, is_turbo],
+                        inputs=[input_image, resolution, num_inference_steps, strength, hdr,
+                                tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
+                             guidance_scale, controlnet_strength, scheduler_name, is_turbo],
                         outputs=[output_slider, output_image])
+
+        # gr.Examples(
+        #     examples=[
+        #         [1536, 20, 0.4, 0, 6, 0.75, "DDIM"],
+        #         [512, 20, 0.55, 0, 6, 0.6, "DDIM"],
+        #         [1024, 20, 0.3, 0, 6, 0.65, "DDIM"]
+        #     ],
+        #     inputs=[resolution, num_inference_steps, strength, hdr, guidance_scale, controlnet_strength, scheduler_name],
+        #     outputs=[],
+        #     fn=gradio_process_image,
+        #     cache_examples=True,
+        # )
 
     demo.launch(debug=False, share=False, server_name='0.0.0.0', server_port=5003)
 

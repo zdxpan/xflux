@@ -183,6 +183,7 @@ class TTP():
         # _, raw_H, raw_W, _ = image.shape 
         raw_H, raw_W = image.size
         w,h = image.size
+        OVERLAP = overlap_rate
         if overlap_rate == 0:
             # 水平方向
             if width_factor == 1:
@@ -205,6 +206,8 @@ class TTP():
                 tile_width = raw_W
             else:
                 tile_width = int(raw_W / (1 + (width_factor - 1) * (1 - overlap_rate)))  # 4608/ (1+  (3-1) * (1-0.1)  )  4608 / (1+ 2*0.9) = 1645
+                if overlap_rate > 1:
+                    tile_width = int((raw_W + OVERLAP * width_factor ) / width_factor)
                 if tile_width % 8 != 0:
                     tile_width = (tile_width // 8) * 8                         # tile_width = 1647 // 8 * 8 = 1640
             # 垂直方向
@@ -212,6 +215,8 @@ class TTP():
                 tile_height = raw_H
             else:
                 tile_height = int(raw_H / (1 + (height_factor - 1) * (1 - overlap_rate)))        #  3072 / (1+ 1*0.9) = 1616
+                if overlap_rate > 1:
+                    tile_height = int((raw_W + OVERLAP * height_factor ) / height_factor)
                 if tile_height % 8 != 0:
                     tile_height = (tile_height // 8) * 8
 

@@ -3,24 +3,23 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from typing import Tuple, List, Union
 from torch import Tensor
+import torch
 import time, os
 import random
 import math, cv2
 import gradio as gr
 from gradio_imageslider import ImageSlider
-import torch
+
 from diffusers import StableDiffusion3Pipeline, StableDiffusion3Img2ImgPipeline
 from diffusers import StableDiffusion3Img2ImgPipeline
 from diffusers.models import SD3Transformer2DModel
 
 
-# from RealESRGAN import RealESRGAN
-import sys
-sys.path.append('/home/dell/workspace/js-sd-svc/src/stable-diffusion/')
-from log import statistical_runtime
+
+from log import logger, statistical_runtime
 from modules.realesrgan import RealESRGAN
 statistical_runtime.reset_collection()
-from modules.llm import QwenClient, MinicpmClient
+from llm import QwenClient, MinicpmClient
 
 LLM_CONFIGS = {
     'qwen': { 'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1", 'api_key': os.getenv("DASHSCOPE_API_KEY") },
@@ -81,7 +80,7 @@ def split_bboxes(w:int, h:int, tile_w:int, tile_h:int, overlap:int=16, init_weig
             bbox_list.append(bbox)
             weight[bbox.slicer] += init_weight
 
-    return bbox_list, weight
+    return bbox_list, weight, cols, rows
 
 @torch.no_grad()
 def generate_llm(prompt, image, model='minicpm-v', width=1024, height=1024, resizer='middle_crop'):
@@ -172,9 +171,9 @@ class LazyRealESRGAN:
         self.model = None
 
     def load_model(self):
-        model_id = '/home/dell/models/realesrgan/weights/'
+        gan_model_id = '/home/dell/models/realesrgan/weights/'
         if self.model is None:
-            self.model = RealESRGAN(model_dir=model_id, device=device, scale=4 ,bg_tile=512, denoise_strength=0.5)
+            self.model = RealESRGAN(model_dir=gan_model_id, device=device,bg_tile=512, denoise_strength=0.5)
             # self.model.load_weights(f'models/upscalers/RealESRGAN_x{self.scale}.pth', download=False)
     def predict(self, img, scale=2):
         self.load_model()
@@ -190,7 +189,9 @@ def resize_and_upscale(input_image, resolution):
     k = float(resolution) / min(H, W)
     H = int(round(H * k / 64.0)) * 64
     W = int(round(W * k / 64.0)) * 64
-    img = input_image.resize((W, H), resample=Image.Resampling.LANCZOS)
+    img = lazy_realesrgan_x2.predict(img)  # use gan, get better result~
+    img = img.resize((W, H), resample=Image.Resampling.LANCZOS)
+
     # img = img.resize(size = (int(W*2), int(H*2)))
     # if scale == 2:
     #     img = lazy_realesrgan_x2.predict(img)
@@ -320,7 +321,7 @@ def gradio_process_image(input_image, resolution, num_inference_steps, strength,
     # tile_width = TILE_SIZE
     # tile_height = TILE_SIZE
     OVERLAP = 64
-    bbox_list, weight = split_bboxes(W, H, tile_width, tile_height, OVERLAP)
+    bbox_list, weight, cols, rows = split_bboxes(W, H, tile_width, tile_height, OVERLAP)
 
     result = np.zeros((H, W, 3), dtype=np.float32)
     weight_sum = np.zeros((H, W, 1), dtype=np.float32)

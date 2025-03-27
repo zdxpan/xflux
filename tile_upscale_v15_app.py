@@ -370,9 +370,17 @@ if __name__ == "__main__":
             with gr.Column():
                 output_slider = ImageSlider(label="Before / After", type="numpy")
         with gr.Accordion("Advanced Options", open=False):
-            resolution = gr.Slider(minimum=128, maximum=4096, value=1536, step=128, label="Resolution")
+    # OVERLAP = 64
+    # # 3840, "height": 2304,
+    # resolution = 3840
+    # TILE_SIZE = 1280
+    # tile_width = 3840 // 2 + OVERLAP
+    # tile_height = 2304 // 2 + OVERLAP
+
+
+            resolution = gr.Slider(minimum=128, maximum=4096, value=3840, step=128, label="Resolution")
             num_inference_steps = gr.Slider(minimum=1, maximum=50, value=20, step=1, label="Number of Inference Steps")
-            strength = gr.Slider(minimum=0, maximum=1, value=0.2, step=0.01, label="Strength")
+            strength = gr.Slider(minimum=0, maximum=1, value=0.4, step=0.01, label="i2i Strength")
             hdr = gr.Slider(minimum=0, maximum=1, value=0, step=0.1, label="HDR Effect")
             guidance_scale = gr.Slider(minimum=0, maximum=20, value=6, step=0.5, label="Guidance Scale")
             controlnet_strength = gr.Slider(minimum=0.0, maximum=2.0, value=0.75, step=0.05, label="ControlNet Strength")
