@@ -29,7 +29,7 @@ from diffusers import FluxControlNetModel, FluxTransformer2DModel
 from tile_vae_processer import AutoencoderKL
 from realesrgan_model import RealESRGAN
 from transformer_model import QuantizedFluxTransformer2DModel, load_origin_parameters, zero_parameters, load_state_dict,load_gguf_q8_0_quantized_parameters
-
+from attention_processor import FluxAttnProcessor2_0
 # from dl_models.flux.tensor_loader.dev_tensor_loader import FluxDevGenerateTensorLoader
 
 from tensor_util import (
@@ -40,6 +40,9 @@ from tensor_util import (
     resize_numpy_image_long, seed_to_int
 )
 from clip_inter_rogator import ClipInterrogator
+# tile _ttp
+from ttp_tile import TTP, split_4bboxes, split_bboxes
+
 
 FLUX_1DEV_MODEL_WEIGHTS = {
     "gguf_8steps_q8_0": "flux.1dev_fuse_8steps_lora_gguf.safetensors",
@@ -498,7 +501,7 @@ class FluxPipeline:
         if not self.prompt_encoder._initiated:
             self.prompt_encoder.initiate()
         self.clip_rogator = ClipInterrogator()
-        # self.clip_rogator.load_model(clip_vit_cache_path, blip_image_caption_path)  # 1.9G
+        self.clip_rogator.load_model(clip_vit_cache_path, blip_image_caption_path)  # 1.9G
 
         #     self.tokenizer_1 = self.prompt_encoder.clip_tokenizer
         #     self.tokenizer_2 = self.prompt_encoder.t5_tokenizer
@@ -588,6 +591,31 @@ class FluxPipeline:
         enable_new_tile = opt.new_tile
         tile_percent = opt.tile_percent
         overlap = 64 // factor
+        # for ttp tile lego~
+        width_scale = 3
+        height_scale = 2
+        tile_processor = TTP()
+        images = prepared_tensors.images
+        image_index = opt.image
+        tile_images = []
+        if image_index is not None and enable_new_tile:
+            image = images[image_index]
+            #  ttplant tile v2: image 3840,2880
+            # tile_width, tile_height = tile_processor.image_width_height(image, width_scale, height_scale, 0.1)   #  
+            # new_tiles, (num_cols, num_rows) = tile_processor.tile_image(image, tile_width, tile_height, factor=factor)
+            # for tile_box in new_tiles:
+            #     tile_im = image.crop(tile_box.box)
+            #     tile_box.prompt = self.clip_rogator.run(image=tile_im, prompt_mode='fast', image_analysis='off')
+            # don`t know how to process with the overlap. seemed each crop apply each`s condition 
+        
+            # use tile diffusion v1: make tile  get eache tile_prompt
+            width, height = image.size
+            tile_images, tiles_weight = split_4bboxes(width, height, overlap=64, device=self.device, factor=factor)
+            for tile_box in tile_images:
+                tile_im = image.crop(tile_box.box)
+                tile_box.prompt = self.clip_rogator.run(image=tile_im, prompt_mode='fast', image_analysis='off')['result'][0][0]
+            prompt_all = opt.prompt + '##' + '##'.join([tile.prompt for tile in tile_images])
+            opt.prompt = prompt_all if '##' not in opt.prompt else opt.prompt
 
         # 2. Encode prompts
         newopt = Namespace(
@@ -609,6 +637,14 @@ class FluxPipeline:
         #     opt.pooled_prompt_embeds.to(self.device),
         #     opt.text_ids.to(self.device),
         # )
+        # put embedding to each tile
+        if len(tile_images) > 0:
+            for inx_, tile_box in enumerate(tile_images):
+                # transformer_args['encoder_hidden_states'] = prompt_embeds[-tile_batch:][inx_]
+                # transformer_args['pooled_projections'] = pooled_prompt_embeds[-tile_batch:][inx_]
+                tile_box.prompt_embeds = prompt_embeds[inx_ + 1]
+                tile_box.pooled_prompt_embeds = pooled_prompt_embeds[inx_ + 1]
+                tile_box.text_ids = text_ids[inx_ + 1]
 
         # 3. Prepare image ids
         image_ids = prepared_tensors.image_ids
@@ -702,24 +738,62 @@ class FluxPipeline:
                              'timestep':t.expand(latent.shape[0]).to(latent.dtype) / 1000,'img_ids':image_ids,'txt_ids':text_ids,'guidance':guidance,'joint_attention_kwargs':None}
                 use_cnet = self.controlnet is not None and len(controlnet_ranges) > 0 and i <= controlnet_ranges[0]
                 controlnet_blocks_repeat = False if hasattr(self.controlnet, 'input_hint_block') and self.controlnet.input_hint_block is None else True
-                # controlnet_block_samples, controlnet_single_block_samples = self.controlnet(
-                #     hidden_states=latent,
-                #     controlnet_cond=controlnet_conds,
-                #     conditioning_scale=controlnet_scales,
-                #     idx=i,
-                #     controlnet_range=controlnet_ranges,
-                #     encoder_hidden_states=prompt_embeds,
-                #     pooled_projections=pooled_prompt_embeds,
-                #     timestep=t.expand(latent.shape[0]).to(latent.dtype) / 1000,
-                #     img_ids=image_ids,
-                #     txt_ids=text_ids,
-                #     guidance=guidance,
-                #     joint_attention_kwargs=None,
-                # ) if self.controlnet is not None else (None, None)                    
+
                 controlnet_block_samples, controlnet_single_block_samples = self.controlnet(**cnet_args) if use_cnet else (None, None)
                 pulid_ca = None
                 # tile
-                if enable_tile:
+                transformer_args = {'hidden_states': latent, 'timestep': t.expand(latent.shape[0]).to(latent.dtype) / 1000,
+                                'guidance': guidance, 'pooled_projections': pooled_prompt_embeds[0],
+                                'encoder_hidden_states': prompt_embeds[0], 'txt_ids': text_ids[0], 
+                                'img_ids':image_ids, 'ip_params':ip_params, 'joint_attention_kwargs': None, 
+                                'controlnet_block_samples': controlnet_block_samples, 
+                                'controlnet_single_block_samples': controlnet_single_block_samples,
+                                'return_dict': False, 'controlnet_blocks_repeat': controlnet_blocks_repeat, 
+                                'pulid_ca': pulid_ca, 'ip_projected_image_embeds': ip_projected_image_embeds,
+                                }
+                if enable_tile and len(tile_images) > 0:
+                    tiles_weight = tiles_weight.to(latent.dtype)
+                    x_latent = unpack_latents(                 #  torch.Size([1, 43200, 64])
+                        latent, height // factor, width // factor, channels
+                    )  #  down sample 8 scale  [1, 16, 360, 480]
+                    x_noise = torch.zeros_like(x_latent)
+                    noises = []
+                    tile_batch = 4
+                    k_col = 2
+                    _, _, h, w = x_latent.shape
+                    for inx_, tile in enumerate(tile_images):
+                        image_ids = prepare_image_ids(
+                            tile.h // factor,  tile.w // factor, 1,
+                        ).to(self.device, dtype=self.dtype)
+                        # self.slicer = slice(None), slice(None), slice(y, y+h), slice(x, x+w)
+                        sub_latent = x_latent[tile.latent_slicer]       #  [1, 16, 188, 248] -> final: torch.Size([1, 16, 188, 248])
+                        
+                        sub_latent = pack_latents(torch.cat([sub_latent], dim=0))   # torch.Size([1, 11656, 64])
+                        tile_guidance = guidance.expand(sub_latent.shape[0])
+                        transformer_args['hidden_states'] = sub_latent
+                        transformer_args['guidance'] = guidance
+                        transformer_args['img_ids'] = image_ids
+                        transformer_args['timestep'] = t.expand(sub_latent.shape[0]).to(latent.dtype) / 1000
+                        transformer_args['encoder_hidden_states'] = tile.prompt_embeds # prompt_embeds[-tile_batch:][inx_] !shape       [512, 4096]
+                        transformer_args['pooled_projections'] =  tile.pooled_prompt_embeds # pooled_prompt_embeds[-tile_batch:][inx_]  [768]
+                        noise = self.transformer(**transformer_args)[0]        # [1, 11656, 64])
+                        noise = unpack_latents(noise, tile.h // factor, tile.w // factor, channels)
+                        noises.append(noise)
+                        x_noise[tile.latent_slicer] += noise * tiles_weight[tile.latent_slicer]
+                    # x_noise = x_noise / tiles_weight
+                    noises = [
+                        noises[i: i + k_col] for i in range(0, len(noises), k_col)
+                    ]
+
+                    noises = [
+                        concatenate_rowwise(elem, overlap * 2) for elem in noises
+                    ]
+                    x_noise = concatenate_columnwise(noises, overlap * 2)
+
+                    x_noise = pack_latents(x_noise)
+
+                elif 0:
+                # if enable_tile:
                     if i > len(timesteps) * tile_percent:
                         image_ids = prepare_image_ids(
                             height // factor // 2 + 64 // factor,
@@ -763,34 +837,16 @@ class FluxPipeline:
                                         'pulid_ca': pulid_ca, 'ip_projected_image_embeds': ip_projected_image_embeds,
                                         }
                         # if enable_new_tile:
-                        if 1:
-                            # new generator processor logic no faster than batch, but sabe 8G gpuBram
-                            noises = []
-                            guidance = torch.tensor([opt.scale], device=self.device)
-                            guidance = guidance.expand(opt.n_samples)
-                            for inx_, sub_latent in enumerate([latent0, latent1, latent2, latent3]):
-                                sub_latent = pack_latents(torch.cat([sub_latent], dim=0))
-                                guidance = guidance.expand(sub_latent.shape[0])
-                                transformer_args['hidden_states'] = sub_latent
-                                transformer_args['guidance'] = guidance
-                                transformer_args['timestep'] = t.expand(sub_latent.shape[0]).to(latent.dtype) / 1000
-                                transformer_args['encoder_hidden_states'] = prompt_embeds[-tile_batch:][inx_]
-                                transformer_args['pooled_projections'] = pooled_prompt_embeds[-tile_batch:][inx_]
-                                noise = self.transformer(**transformer_args)[0]        # [1, 11656, 64])
-                                noise = unpack_latents(noise, height // factor // 2 + overlap, width // factor // 2 + overlap, channels)
-                                noises.append(noise)
-                        else:   # old processor make it as batch, i think batch is too slow~
-                            noise = self.transformer(**transformer_args)[0] # [4, 11656, 64])
+                        noise = self.transformer(**transformer_args)[0] # [4, 11656, 64])
 
-                            noise = unpack_latents(
-                                noise,
-                                height // factor // 2 + overlap,
-                                width // factor // 2 + overlap,
-                                channels,
-                            )  # torch.Size([4, 16, 188, 248])
+                        noise = unpack_latents(
+                            noise,
+                            height // factor // 2 + overlap,
+                            width // factor // 2 + overlap,
+                            channels,
+                        )  # torch.Size([4, 16, 188, 248])
 
-                            noises = [elem for elem in torch.split(noise, 1, dim=0)]  # 4 [] torch.Size([1, 16, 188, 248])
-                        
+                        noises = [elem for elem in torch.split(noise, 1, dim=0)]  # 4 [] torch.Size([1, 16, 188, 248])
 
                         noises = [
                             noises[i: i + k_col] for i in range(0, len(noises), k_col)
@@ -946,6 +1002,8 @@ class FluxPipeline:
         # self.load_lora(mixin)
         # self.load_controlnets(controlnets)
         # self.load_ip_adapters(ip_adapters)
+        print('>>  enable sage attn speed')
+        self.transformer.set_attn_processor(FluxAttnProcessor2_0())
 
         for model in self.models:
             model.to(self.device)
@@ -1133,11 +1191,11 @@ if __name__ == '__main__':
         "steps": 30, "n_samples": 1,
         "tile_percent": 0, "enable_tile": True, "new_tile": True,   # 启用分块放大算法~
         "width": 3840, "height": 2880,
-        "file": [img], "image": 0,  "strength": 0.65,
+        "file": [img], "image": 0,  "strength": 0.35,
         "mask": None,  "scale": 4.5,
         "seed": [-1], "variant": 0.0, "variant_seed": [-1],
     }
-    args['prompt'] = '##'.join([args['prompt']]*5)
+    # args['prompt'] = '##'.join([args['prompt']]*5)
     default_template.update(args)
     normal_input = FluxNormalInput(**default_template)
     normal_input.normal_width, normal_input.normal_height = normalize_size(

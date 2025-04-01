@@ -9,35 +9,37 @@ from PIL import Image
 from typing import Tuple, List, Union
 from torch import Tensor
 import torch
-import time, os
+import time, os, copy
 import random
 import math, cv2
 import gradio as gr
 from gradio_imageslider import ImageSlider
 
+from dataclasses import dataclass, field, asdict
+
 from diffusers import StableDiffusion3Pipeline, StableDiffusion3Img2ImgPipeline
 from diffusers import StableDiffusion3Img2ImgPipeline
 from diffusers.models import SD3Transformer2DModel
+from diffusers.utils import make_image_grid
+import matplotlib.pyplot as plt
 
-from dataclasses import dataclass, field, asdict
+
 from log import logger, statistical_runtime
 statistical_runtime.reset_collection()
 from flux_pipe import FluxPipeline, FluxNormalInput, normalize_size
 from text_encoder import PromptEncoder
-import os, copy
+
 from llm import QwenClient, MinicpmClient
 from realesrgan_model import RealESRGAN
-import matplotlib.pyplot as plt
-
 from clip_inter_rogator import ClipInterrogator
 from ttp_tile import concatenate_columnwise, concatenate_rowwise, tensor2pil, pil2tensor
 from ttp_tile import TTP
-from diffusers.utils import make_image_grid
+
 
 dtype=torch.bfloat16
 device = "cuda"
 model_id = '/data/models/'
-sd3_modelid = '/home/dell/models/stable-diffusion-3.5/'
+sd35_modelid = '/home/dell/models/stable-diffusion-3.5-medium/'
 sd3turbo_modelid = '/home/dell/models/stable-diffusion-3.5-large-turbo/'
 
 clip_vit_cache_path = '/data/comfy_model/clip_interrogator/'
@@ -48,10 +50,7 @@ LLM_CONFIGS = {
     # 'minicpm': { 'base_url': "http://prod.tair.a1-llm.xiaopiu.com//api/llava/generate", 'api_key': '' }
     'minicpm': { 'base_url': "http://192.168.1.4:5001/api/minicpm/generate", 'api_key': '' }        # ok pass    
 }
-LLM_MODELS = {
-    'qwen': QwenClient,
-    'minicpm': MinicpmClient
-}
+LLM_MODELS = {'qwen': QwenClient, 'minicpm': MinicpmClient}
 
 DEFAULT_INDEX = {
     "annotator": model_id+"annotator",
@@ -63,23 +62,99 @@ DEFAULT_INDEX = {
 }
 
 # annotator = Annotator(self.index["_"]["annotator"], self.device)
-
-text_encoder = PromptEncoder(
-    base=DEFAULT_INDEX["flux"],
-    device=device,
-    dtype=torch.bfloat16,
-)
-f1pipe = FluxPipeline(base = DEFAULT_INDEX['flux']['root'], device=device, dtype=torch.bfloat16,esrgan=None, 
-            controlnet=None, encoder_hid_proj=None, 
-            prompt_encoder=text_encoder, annotator=None
-        )
-f1pipe.initiate()
+# simple Caption model~
 clip_rogator = ClipInterrogator()
 clip_rogator.load_model(clip_vit_cache_path, blip_image_caption_path)  # 1.9G
 
+def timer_func(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        print(f"{func.__name__} took {end_time - start_time:.2f} seconds")
+        return result
+    return wrapper
+
+class LazyFluxPipeline():
+    def __init__(self):
+        self.pipe = None
+    def load():
+        text_encoder = PromptEncoder(
+            base=DEFAULT_INDEX["flux"],
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        f1pipe = FluxPipeline(base = DEFAULT_INDEX['flux']['root'], device=device, dtype=torch.bfloat16,esrgan=None, 
+                    controlnet=None, encoder_hid_proj=None, 
+                    prompt_encoder=text_encoder, annotator=None
+                )
+        f1pipe.initiate()
+        return f1pipe
+        
+class LazyFluxSchellPipeline():
+    def __init__(self):
+        self.pipe = None
+    @timer_func
+    def load(self):
+        from diffusers import FluxImg2ImgPipeline
+        # pipe = FluxImg2ImgPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+        pipe = FluxImg2ImgPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+        return pipe
 
 default_params = FluxNormalInput(task='generate')
 default_template: dict = asdict(default_params)
+
+class LazyLoadPipeline:
+    def __init__(self):
+        self.pipe = None
+
+    @timer_func
+    def load(self):
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            sd35_modelid, 
+            torch_dtype=torch.bfloat16
+        ).to(device)
+                # load turvo model
+        from diffusers.models import SD3Transformer2DModel
+        # transformer_turbo = SD3Transformer2DModel.from_pretrained(
+        #     sd3turbo_modelid,  subfolder='transformer', #"diffusers/controlnet-canny-sdxl-1.0",
+        #     torch_dtype=dtype, use_safetensors=True,
+        # ).to(device)
+        transformer = SD3Transformer2DModel.from_pretrained(
+            sd35_modelid,  subfolder='transformer',
+            torch_dtype=dtype, use_safetensors=True,
+        ).to(device)
+        pipe.transformer = transformer
+        self.transformer = transformer
+
+        self.sd3pipe = StableDiffusion3Pipeline(
+            transformer=pipe.transformer, 
+            scheduler=pipe.scheduler, 
+            vae = pipe.vae, 
+            text_encoder = pipe.text_encoder, 
+            text_encoder_2 = pipe.text_encoder_2, 
+            text_encoder_3 = pipe.text_encoder_3, 
+            tokenizer = pipe.tokenizer,
+            tokenizer_2 = pipe.tokenizer_2,
+            tokenizer_3 = pipe.tokenizer_3)
+        self.sd3i2ipipe = StableDiffusion3Img2ImgPipeline(
+            transformer=pipe.transformer, 
+            scheduler=pipe.scheduler, 
+            vae = pipe.vae, 
+            text_encoder = pipe.text_encoder, 
+            text_encoder_2 = pipe.text_encoder_2, 
+            text_encoder_3 = pipe.text_encoder_3, 
+            tokenizer = pipe.tokenizer,
+            tokenizer_2 = pipe.tokenizer_2,
+            tokenizer_3 = pipe.tokenizer_3)
+
+        # self.pipe.vae.enable_tiling()
+        # self.pipe.vae.enable_slicing()
+        # pipe.enable_freeu(s1=0.9, s2=0.2, b1=1.3, b2=1.4)
+        return pipe, self.sd3i2ipipe
+    
+    def __call__(self, *args, **kwargs):
+        return self.pipe(*args, **kwargs)
 
 
 
@@ -104,14 +179,6 @@ class MultiplySigmas:
         return sigmas
 
 
-def timer_func(func):
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        print(f"{func.__name__} took {end_time - start_time:.2f} seconds")
-        return result
-    return wrapper
 
 def ceildiv(big, small):
     # Correct ceiling division that avoids floating-point errors and importing math.ceil.
@@ -187,65 +254,6 @@ def generate_llm(prompt, image, model='minicpm-v', width=1024, height=1024, resi
     ground_prompt = msg['content']
     print('>> ground_prompt:', ground_prompt)
     return ground_prompt
-
-
-class LazyLoadPipeline:
-    def __init__(self):
-        self.pipe = None
-
-    @timer_func
-    def load(self):
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            sd3_modelid, 
-            torch_dtype=torch.bfloat16
-        ).to(device)
-                # load turvo model
-        from diffusers.models import SD3Transformer2DModel
-        # transformer_turbo = SD3Transformer2DModel.from_pretrained(
-        #     sd3turbo_modelid,  subfolder='transformer', #"diffusers/controlnet-canny-sdxl-1.0",
-        #     torch_dtype=dtype, use_safetensors=True,
-        # ).to(device)
-        transformer = SD3Transformer2DModel.from_pretrained(
-            sd3_modelid,  subfolder='transformer', #"diffusers/controlnet-canny-sdxl-1.0",
-            torch_dtype=dtype, use_safetensors=True,
-        ).to(device)
-        pipe.transformer = transformer
-        # self.transformer_turbo = transformer_turbo
-        self.transformer = transformer
-
-        self.sd3pipe = StableDiffusion3Pipeline(
-            transformer=pipe.transformer, 
-            scheduler=pipe.scheduler, 
-            vae = pipe.vae, 
-            text_encoder = pipe.text_encoder, 
-            text_encoder_2 = pipe.text_encoder_2, 
-            text_encoder_3 = pipe.text_encoder_3, 
-            tokenizer = pipe.tokenizer,
-            tokenizer_2 = pipe.tokenizer_2,
-            tokenizer_3 = pipe.tokenizer_3)
-        self.sd3i2ipipe = StableDiffusion3Img2ImgPipeline(
-            transformer=pipe.transformer, 
-            scheduler=pipe.scheduler, 
-            vae = pipe.vae, 
-            text_encoder = pipe.text_encoder, 
-            text_encoder_2 = pipe.text_encoder_2, 
-            text_encoder_3 = pipe.text_encoder_3, 
-            tokenizer = pipe.tokenizer,
-            tokenizer_2 = pipe.tokenizer_2,
-            tokenizer_3 = pipe.tokenizer_3)
-
-        # self.pipe.vae.enable_tiling()
-        # self.pipe.vae.enable_slicing()
-        # pipe.load_lora_weights(model_index['lora1'])   #    "models/Lora/SDXLrender_v2.0.safetensors")
-        # pipe.fuse_lora(lora_scale=0.5)
-        # pipe.load_lora_weights(model_index['lora2'])  #    "models/Lora/more_details.safetensors")
-        # pipe.fuse_lora(lora_scale=1.)
-        # pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-        # pipe.enable_freeu(s1=0.9, s2=0.2, b1=1.3, b2=1.4)
-        return pipe
-    
-    def __call__(self, *args, **kwargs):
-        return self.pipe(*args, **kwargs)
 
 
 class LazyRealESRGAN:
@@ -383,7 +391,7 @@ if 0:
 
 # @spaces.GPU
 @timer_func
-def gradio_process_image(input_image, resolution, steps, strength, hdr, 
+def ttp_process_image(input_image, resolution, steps, strength, hdr, 
     tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
     guidance_scale, controlnet_strength, scheduler_name, is_turbo):
     statistical_runtime.reset_collection()
@@ -420,11 +428,10 @@ def gradio_process_image(input_image, resolution, steps, strength, hdr,
     for bbox in bbox_list:
         left, top, right, bottom = bbox.box
         tile_w, tile_h = right - left, bottom - top
-        tile = input_image.crop((left, top, right, bottom))
-        # bbox.prompt = generate_llm('describe this image in English', tile, model='qwen-vl-plus')
+        tile = input_image.crop((left, top, right, bottom))       # bbox.prompt = generate_llm('describe this image in English', tile, model='qwen-vl-plus')
         res = clip_rogator.run(image=tile, prompt_mode='fast', image_analysis='off')
         bbox.prompt = res['result'][0][0]
-        print(f'>> __tile__ {(left, top, right, bottom)} size {tile_w, tile_h} prompt:{len(bbox.prompt)}')
+        # print(f'>> __tile__ {(left, top, right, bottom)} size {tile_w, tile_h} prompt:{len(bbox.prompt)}')
 
     result = np.zeros((H, W, 3), dtype=np.float32)
     result_list = []
@@ -444,15 +451,16 @@ def gradio_process_image(input_image, resolution, steps, strength, hdr,
         # Process the tile
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=dtype):
-                if 0:
-                    result_tile = lazy_pipe.sd3i2ipipe(
-                        prompt=bbox.prompt,height=tile_height, width=tile_width, num_inference_steps=num_inference_steps, 
+                steps = steps
+                sigmas=np.linspace(1.0, 1 / steps, steps)
+                mult_sgma = MultiplySigmas()
+                sigmas=mult_sgma.simple_output(sigmas, sigma_scale, sigma_start, sigma_end)
+                if isinstance(model_pipe, StableDiffusion3Img2ImgPipeline):
+                    result_tile = model_pipe(
+                        prompt=bbox.prompt, negative_prompt="smooth, blur, digtal",
+                        height=tile_height, width=tile_width, num_inference_steps=steps, sigmas=sigmas,
                         image=tile, strength=strength, guidance_scale=guidance_scale).images[0]
                 else:
-                    steps = steps
-                    sigmas=np.linspace(1.0, 1 / steps, steps)
-                    mult_sgma = MultiplySigmas()
-                    sigmas=mult_sgma.simple_output(sigmas, sigma_scale, sigma_start, sigma_end)
                     args = {
                         "prompt": bbox.prompt, "resizer": 'crop_middle', "steps": steps, "n_samples": 1,
                         "tile_percent": 0, "enable_tile": False, "new_tile": False,   # 启用分块放大算法~
@@ -463,9 +471,9 @@ def gradio_process_image(input_image, resolution, steps, strength, hdr,
                     normal_input = FluxNormalInput(**default_template)
                     normal_input.normal_width, normal_input.normal_height = normalize_size(
                             normal_input.width, normal_input.height, 4096)
-                    result_pipe = f1pipe(normal_input)
+                    result_pipe = model_pipe(normal_input)
                     result_tile = result_pipe['images'][0]
-                    result_list.append(result_tile)
+                result_list.append(result_tile)
                                     
             # Apply gaussian weighting
             tile_weight = gaussian_weight[:current_tile_size[0], :current_tile_size[1]]  # h, w
@@ -474,15 +482,11 @@ def gradio_process_image(input_image, resolution, steps, strength, hdr,
             weight_sum[top:bottom, left:right] += tile_weight[:, :, np.newaxis]
     
     # Normal liner result WAY |
-    debug_im = make_image_grid(
-        result_list, cols=cols, rows=rows
-    )
-    debug_im.save('/home/dell/workspace/js-ai-svc/src/xflux/1_debug_tile_neeTTP_.png')
+    # make_image_grid( result_list, cols=cols, rows=rows ).save('/home/dell/study/xflux/1_debug_tile_neeTTP_.png')
     result_list = [pil2tensor(im_).permute(0, 3, 1,2) for im_ in result_list]
     result_list = [
         result_list[i: i + cols] for i in range(0, len(result_list), cols)
     ]
-    # 线性拼接~ overlap
     stitched_image_matrix_tensor = [
         concatenate_rowwise(elem, OVERLAP * 2) for elem in result_list
     ]
@@ -490,14 +494,49 @@ def gradio_process_image(input_image, resolution, steps, strength, hdr,
     stitched_image = tensor2pil(
         stitched_image_matrix_tensor.permute(0, 2, 3 ,1)
     )
-
     # Normalize the result WAY ||  较大的tile 存在overlap伪影~
     final_result = (result / weight_sum).astype(np.uint8)
+    input_image = Image.fromarray(input_image) if not isinstance(input_image, Image.Image) else input_image        
+    output_pil = Image.fromarray(final_result)
+    return stitched_image, output_pil
+    # return gr.update(value = [input_image,stitched_image]), gr.update(value=stitched_image)
+
+def gradio_process_image(input_image, resolution, steps, strength, hdr, 
+    tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
+    guidance_scale, controlnet_strength, scheduler_name, is_turbo):
+
+    # f1pipe is global defined 
+    stitched_image, _raw_im = ttp_process_image(f1pipe, 
+        input_image, resolution, steps, strength, hdr, 
+        tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
+        guidance_scale, controlnet_strength, scheduler_name, is_turbo)
     if not isinstance(input_image, Image.Image):
         input_image = Image.fromarray(input_image)
-    output_pil = Image.fromarray(final_result)
-    print("Image processing completed successfully")
     return gr.update(value = [input_image,stitched_image]), gr.update(value=stitched_image)
+
+def test_bath_generate(images, save_dir, mode_pipeline, model_type = 'flux'):
+    """"input imges: file pathe"""
+    import tqdm
+    resolution = 3840
+    steps = 25
+    strength = 0.35
+    hdr = 0.1
+    tile_rows, tile_cols = 2, 2
+    sigma_scale, sigma_start, sigma_end = 0.95, 0.3, 0.6
+    guidance_scale, controlnet_strength, scheduler_name, is_turbo = 0.5, 0.0, 'xxx',  False
+    with tqdm.tqdm(len(images)) as bar:
+        for im in images:
+            input_image = Image.open(im)
+            file_name = im.split('/')[-1].replace('.png', f'_{model_type}.jpeg')
+            save_name = os.path.join(save_dir, file_name)
+            if os.path.exists(save_name):
+                continue
+            res_image, _raw_im = ttp_process_image(mode_pipeline, input_image, resolution, steps, strength, hdr, 
+                tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
+                guidance_scale, controlnet_strength, scheduler_name, is_turbo)
+            res_image.save(save_name)
+            print(f'>> {save_name} finish!')
+            bar.update()
 
 
 if __name__ == "__main__":
@@ -563,6 +602,20 @@ if __name__ == "__main__":
         #     fn=gradio_process_image,
         #     cache_examples=True,
         # )
+    if 0:
+        demo.launch(debug=False, share=False, server_name='0.0.0.0', server_port=5003)
+    else:
+        import glob
+        tuchong_images_ = '/home/dell/workspace/img/tuchong_self_right_aigc_samples/*.png'
+        save_dir = '/home/dell/workspace/img/tuchong_self_right_aigc_samples/'
+        tuchong_images = glob.glob(tuchong_images_)
+        print('>> all images loaded ', len(tuchong_images))
+        # f1pipe = LazyFluxPipeline().load()
+        # print('>> f1 pipline load done~')
+        # test_bath_generate(tuchong_images, save_dir, f1pipe, model_type = 'flux')
 
-    demo.launch(debug=False, share=False, server_name='0.0.0.0', server_port=5003)
+        sd35pipe, sd35pipei2i = LazyLoadPipeline().load()
+        print('>> f1 pipline load done~')
+        test_bath_generate(tuchong_images, save_dir, sd35pipei2i, model_type = 'sd35mid')
+
 

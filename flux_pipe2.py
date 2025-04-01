@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, asdict
 from io import BytesIO
 from pathlib import Path
 from argparse import Namespace
+from text_encoder import PromptEncoder
 
 
 import diffusers
@@ -41,6 +42,7 @@ from tensor_util import (
 from clip_inter_rogator import ClipInterrogator
 # tile _ttp
 from ttp_tile import TTP, split_4bboxes, split_bboxes
+
 
 FLUX_1DEV_MODEL_WEIGHTS = {
     "gguf_8steps_q8_0": "flux.1dev_fuse_8steps_lora_gguf.safetensors",
@@ -589,6 +591,7 @@ class FluxPipeline:
         enable_new_tile = opt.new_tile
         tile_percent = opt.tile_percent
         overlap = 64 // factor
+        # for ttp tile lego~
         width_scale = 3
         height_scale = 2
         tile_processor = TTP()
@@ -999,6 +1002,7 @@ class FluxPipeline:
         # self.load_lora(mixin)
         # self.load_controlnets(controlnets)
         # self.load_ip_adapters(ip_adapters)
+        print('>>  enable sage attn speed')
         self.transformer.set_attn_processor(FluxAttnProcessor2_0())
 
         for model in self.models:
