@@ -503,20 +503,6 @@ class FluxPipeline:
         self.clip_rogator = ClipInterrogator()
         self.clip_rogator.load_model(clip_vit_cache_path, blip_image_caption_path)  # 1.9G
 
-        #     self.tokenizer_1 = self.prompt_encoder.clip_tokenizer
-        #     self.tokenizer_2 = self.prompt_encoder.t5_tokenizer
-        #     self.text_encoder_1    = self.prompt_encoder.clip_encoder
-        #     self.text_encoder_2    = self.prompt_encoder.t5_encoder
-        # else:
-            # self.text_encoder_1 = CLIPTextModel.from_pretrained(
-            #     self.base,subfolder='text_encoder',torch_dtype=self.dtype).to(self.device)
-            # self.text_encoder_2 = T5EncoderModel.from_pretrained(self.base,subfolder='text_encoder_2_full_weight',
-            #     torch_dtype=self.dtype).to(self.device)
-            # self.tokenizer_1 = CLIPTokenizer.from_pretrained(self.base,
-            #     subfolder='tokenizer',torch_dtype=self.dtype)
-            # self.tokenizer_2 = T5Tokenizer.from_pretrained(self.base,subfolder='tokenizer_2',
-            #     torch_dtype=self.dtype)
-
         self.vae = AutoencoderKL.from_pretrained(
             self.base, subfolder="vae", torch_dtype=self.dtype
         )
@@ -626,12 +612,22 @@ class FluxPipeline:
         text_embedding_dc = self.prompt_encoder(newopt)   # about 5 sec
         # for k,v in text_embedding_dc.items():
         #     print(f'{k}: {v.shape}')
-        self.prompt_encoder.clear_gpu_model()
         prompt_embeds, pooled_prompt_embeds, text_ids = (
             text_embedding_dc['prompt_embeds'].to(self.device),
             text_embedding_dc['pooled_prompt_embeds'].to(self.device),
             text_embedding_dc['text_ids'].to(self.device),
         )
+        if do_true_cfg:
+            newopt.prompt = opt.negative_prompt
+            uncond_text_embedding_dc = self.prompt_encoder(newopt)   # about 5 sec
+            uncond_prompt_embeds, uncond_pooled_prompt_embeds, uncond_text_ids = (
+                text_embedding_dc['prompt_embeds'].to(self.device),
+                text_embedding_dc['pooled_prompt_embeds'].to(self.device),
+                text_embedding_dc['text_ids'].to(self.device),
+            )
+
+        self.prompt_encoder.clear_gpu_model()
+
         # prompt_embeds, pooled_prompt_embeds, text_ids = (
         #     opt.prompt_embeds.to(self.device),
         #     opt.pooled_prompt_embeds.to(self.device),
@@ -792,90 +788,6 @@ class FluxPipeline:
 
                     x_noise = pack_latents(x_noise)
 
-                elif 0:
-                # if enable_tile:
-                    if i > len(timesteps) * tile_percent:
-                        image_ids = prepare_image_ids(
-                            height // factor // 2 + 64 // factor,
-                            width // factor // 2 + 64 // factor,
-                            1,
-                        ).to(self.device, dtype=self.dtype)
-
-                        x_latent = unpack_latents(
-                            latent, height // factor, width // factor, channels
-                        )
-                        x_noise = torch.zeros_like(x_latent)
-                        _, _, h, w = x_latent.shape
-
-                        latent0 = x_latent[
-                                  :, :, 0: h // 2 + overlap, 0: w // 2 + overlap
-                                  ]
-                        latent1 = x_latent[
-                                  :, :, 0: h // 2 + overlap, w // 2 - overlap:
-                                  ]
-                        latent2 = x_latent[
-                                  :, :, h // 2 - overlap:, 0: w // 2 + overlap
-                                  ]
-                        latent3 = x_latent[:, :, h // 2 - overlap:, w // 2 - overlap:]
-                        x_latent = torch.cat(
-                            [latent0, latent1, latent2, latent3], dim=0
-                        )
-                        x_latent = pack_latents(x_latent)
-
-                        guidance = guidance.expand(x_latent.shape[0])
-
-                        tile_batch = 4
-                        k_col = 2
-
-                        transformer_args = {'hidden_states': x_latent, 'timestep': t.expand(x_latent.shape[0]).to(latent.dtype) / 1000,
-                                        'guidance': guidance, 'pooled_projections': pooled_prompt_embeds[-tile_batch:],
-                                        'encoder_hidden_states': prompt_embeds[-tile_batch:], 'txt_ids': text_ids[0], 
-                                        'img_ids':image_ids, 'ip_params':ip_params, 'joint_attention_kwargs': None, 
-                                        'controlnet_block_samples': controlnet_block_samples, 
-                                        'controlnet_single_block_samples': controlnet_single_block_samples,
-                                        'return_dict': False, 'controlnet_blocks_repeat': controlnet_blocks_repeat, 
-                                        'pulid_ca': pulid_ca, 'ip_projected_image_embeds': ip_projected_image_embeds,
-                                        }
-                        # if enable_new_tile:
-                        noise = self.transformer(**transformer_args)[0] # [4, 11656, 64])
-
-                        noise = unpack_latents(
-                            noise,
-                            height // factor // 2 + overlap,
-                            width // factor // 2 + overlap,
-                            channels,
-                        )  # torch.Size([4, 16, 188, 248])
-
-                        noises = [elem for elem in torch.split(noise, 1, dim=0)]  # 4 [] torch.Size([1, 16, 188, 248])
-
-                        noises = [
-                            noises[i: i + k_col] for i in range(0, len(noises), k_col)
-                        ]
-
-                        noises = [
-                            concatenate_rowwise(elem, overlap * 2) for elem in noises
-                        ]
-                        x_noise = concatenate_columnwise(noises, overlap * 2)
-
-                        x_noise = pack_latents(x_noise)
-                    else:
-                        x_noise = self.transformer(
-                            hidden_states=latent,
-                            timestep=t.expand(latent.shape[0]).to(latent.dtype) / 1000,
-                            guidance=guidance,
-                            pooled_projections=pooled_prompt_embeds[:1],
-                            encoder_hidden_states=prompt_embeds[:1],
-                            txt_ids=text_ids,
-                            img_ids=image_ids,
-                            ip_params=ip_params,
-                            joint_attention_kwargs=None,
-                            controlnet_block_samples=controlnet_block_samples,
-                            controlnet_single_block_samples=controlnet_single_block_samples,
-                            return_dict=False,
-                            controlnet_blocks_repeat=controlnet_blocks_repeat,
-                            pulid_ca=pulid_ca,
-                            ip_projected_image_embeds=ip_projected_image_embeds,
-                        )[0]
                 else:
                     x_noise = self.transformer(
                         hidden_states=latent,
@@ -895,6 +807,31 @@ class FluxPipeline:
                         ip_projected_image_embeds=ip_projected_image_embeds,
                     )[0]
 
+                if (i <= zero_steps) and use_zero_init:
+                    x_noise = x_noise*0.
+
+                elif do_true_cfg and i <= cfg_skip_steps: # and steps in range of ~ cfg_range # useing my newly code~
+                    # uncond_prompt_embeds, uncond_pooled_prompt_embeds, uncond_text_ids
+                    neg_noise_pred = self.transformer(
+                        hidden_states=latent,
+                        timestep=t.expand(latent.shape[0]).to(latent.dtype) / 1000,
+                        guidance=guidance,
+                        pooled_projections=uncond_pooled_prompt_embeds,
+                        encoder_hidden_states=uncond_prompt_embeds,
+                        txt_ids=uncond_text_ids,
+                        img_ids=image_ids,
+                        ip_params=ip_params,
+                        joint_attention_kwargs=None,
+                        controlnet_block_samples=controlnet_block_samples,
+                        controlnet_single_block_samples=controlnet_single_block_samples,
+                        return_dict=False,
+                        controlnet_blocks_repeat=controlnet_blocks_repeat,
+                        pulid_ca=pulid_ca,
+                        ip_projected_image_embeds=ip_projected_image_embeds,
+                    )[0]
+                    # noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+                    noise_pred = x_noise
+                    x_noise = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 # compute the previous noisy sample x_t -> x_t-1
                 latent = self.scheduler.step(x_noise, t, latent, return_dict=False)[0]
 

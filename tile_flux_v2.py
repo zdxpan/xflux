@@ -19,6 +19,9 @@ from dataclasses import dataclass, field, asdict
 
 from diffusers import StableDiffusion3Pipeline, StableDiffusion3Img2ImgPipeline
 from diffusers import StableDiffusion3Img2ImgPipeline
+
+from diffusers import FluxImg2ImgPipeline
+
 from diffusers.models import SD3Transformer2DModel
 from diffusers.utils import make_image_grid
 import matplotlib.pyplot as plt
@@ -40,6 +43,7 @@ dtype=torch.bfloat16
 device = "cuda"
 model_id = '/data/models/'
 sd35_modelid = '/home/dell/models/stable-diffusion-3.5-medium/'
+flux_schnell = '/home/dell/models/FLUX.1-schnell-hf/'
 sd3turbo_modelid = '/home/dell/models/stable-diffusion-3.5-large-turbo/'
 
 clip_vit_cache_path = '/data/comfy_model/clip_interrogator/'
@@ -78,7 +82,7 @@ def timer_func(func):
 class LazyFluxPipeline():
     def __init__(self):
         self.pipe = None
-    def load():
+    def load(self):
         text_encoder = PromptEncoder(
             base=DEFAULT_INDEX["flux"],
             device=device,
@@ -98,7 +102,8 @@ class LazyFluxSchellPipeline():
     def load(self):
         from diffusers import FluxImg2ImgPipeline
         # pipe = FluxImg2ImgPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
-        pipe = FluxImg2ImgPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+        pipe = FluxImg2ImgPipeline.from_pretrained(flux_schnell, torch_dtype=torch.bfloat16)
+        pipe.enable_model_cpu_offload()
         return pipe
 
 default_params = FluxNormalInput(task='generate')
@@ -391,9 +396,9 @@ if 0:
 
 # @spaces.GPU
 @timer_func
-def ttp_process_image(input_image, resolution, steps, strength, hdr, 
+def ttp_process_image(model_pipe, input_image, resolution, steps, strength, hdr, 
     tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
-    guidance_scale, controlnet_strength, scheduler_name, is_turbo):
+    guidance_scale, controlnet_strength, scheduler_name, is_turbo, kwargs):
     statistical_runtime.reset_collection()
 
     print("Starting image processing...")
@@ -410,6 +415,11 @@ def ttp_process_image(input_image, resolution, steps, strength, hdr,
         tile_width = W // 2 + OVERLAP
         tile_height = H // 2 + OVERLAP
         bbox_list, weight, cols, rows = split_bboxes(W, H, tile_width, tile_height, OVERLAP)  # 不能均等切割~
+
+        if tile_cols < 2 and tile_rows < 2:
+            tile_width, tile_height =  W, H
+            bbox_list, weight, cols, rows = split_bboxes(W, H, tile_width, tile_height, OVERLAP)  # 不能均等切割~
+
     elif 0:  # no same tile 
         tile_width, tile_height = adaptive_tile_size((W, H), base_tile_size=1280, max_tile_size=1920)  # max_tile_size=1920
         bbox_list, weight, cols, rows = split_bboxes(W, H, tile_width, tile_height, OVERLAP)  # 不能均等切割~
@@ -451,6 +461,8 @@ def ttp_process_image(input_image, resolution, steps, strength, hdr,
         # Process the tile
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=dtype):
+                if isinstance(model_pipe, FluxImg2ImgPipeline):
+                    steps = 6 # schnell~
                 steps = steps
                 sigmas=np.linspace(1.0, 1 / steps, steps)
                 mult_sgma = MultiplySigmas()
@@ -460,6 +472,11 @@ def ttp_process_image(input_image, resolution, steps, strength, hdr,
                         prompt=bbox.prompt, negative_prompt="smooth, blur, digtal",
                         height=tile_height, width=tile_width, num_inference_steps=steps, sigmas=sigmas,
                         image=tile, strength=strength, guidance_scale=guidance_scale).images[0]
+                elif isinstance(model_pipe, FluxImg2ImgPipeline):
+                    result_tile = model_pipe(
+                        prompt=bbox.prompt,
+                        height=tile_height, width=tile_width, num_inference_steps=steps, sigmas=sigmas,
+                        image=tile, strength=strength, guidance_scale=0).images[0]
                 else:
                     args = {
                         "prompt": bbox.prompt, "resizer": 'crop_middle', "steps": steps, "n_samples": 1,
@@ -509,12 +526,12 @@ def gradio_process_image(input_image, resolution, steps, strength, hdr,
     stitched_image, _raw_im = ttp_process_image(f1pipe, 
         input_image, resolution, steps, strength, hdr, 
         tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
-        guidance_scale, controlnet_strength, scheduler_name, is_turbo)
+        guidance_scale, controlnet_strength, scheduler_name, is_turbo, kwargs={})
     if not isinstance(input_image, Image.Image):
         input_image = Image.fromarray(input_image)
     return gr.update(value = [input_image,stitched_image]), gr.update(value=stitched_image)
 
-def test_bath_generate(images, save_dir, mode_pipeline, model_type = 'flux'):
+def test_bath_generate(images, save_dir, mode_pipeline, model_type = 'flux', kwargs={}):
     """"input imges: file pathe"""
     import tqdm
     resolution = 3840
@@ -533,7 +550,7 @@ def test_bath_generate(images, save_dir, mode_pipeline, model_type = 'flux'):
                 continue
             res_image, _raw_im = ttp_process_image(mode_pipeline, input_image, resolution, steps, strength, hdr, 
                 tile_rows, tile_cols, sigma_scale, sigma_start, sigma_end,
-                guidance_scale, controlnet_strength, scheduler_name, is_turbo)
+                guidance_scale, controlnet_strength, scheduler_name, is_turbo, kwargs=kwargs)
             res_image.save(save_name)
             print(f'>> {save_name} finish!')
             bar.update()
@@ -602,7 +619,9 @@ if __name__ == "__main__":
         #     fn=gradio_process_image,
         #     cache_examples=True,
         # )
-    if 0:
+    if 1:
+        global f1pipe
+        f1pipe = LazyFluxPipeline().load()
         demo.launch(debug=False, share=False, server_name='0.0.0.0', server_port=5003)
     else:
         import glob
@@ -610,12 +629,23 @@ if __name__ == "__main__":
         save_dir = '/home/dell/workspace/img/tuchong_self_right_aigc_samples/'
         tuchong_images = glob.glob(tuchong_images_)
         print('>> all images loaded ', len(tuchong_images))
-        # f1pipe = LazyFluxPipeline().load()
-        # print('>> f1 pipline load done~')
-        # test_bath_generate(tuchong_images, save_dir, f1pipe, model_type = 'flux')
+        # 1 - flux dev ~
+        if 0:
+            f1pipe = LazyFluxPipeline().load()
+            print('>> f1 pipline load done~')
+            test_bath_generate(tuchong_images, save_dir, f1pipe, model_type = 'flux')
+        # 2 - flux schnell ~  speed is poor,need optimaze~!
+        if 1:
+            schnell_pipe = LazyFluxSchellPipeline().load()
+            test_bath_generate(tuchong_images, save_dir, schnell_pipe, model_type = 'flux_schnell', kwargs = {'steps': 6})
+        if 0:
+            sd35pipe, sd35pipei2i = LazyLoadPipeline().load()
+            print('>> f1 pipline load done~')
+            test_bath_generate(tuchong_images, save_dir, sd35pipei2i, model_type = 'sd35mid')
 
-        sd35pipe, sd35pipei2i = LazyLoadPipeline().load()
-        print('>> f1 pipline load done~')
-        test_bath_generate(tuchong_images, save_dir, sd35pipei2i, model_type = 'sd35mid')
+        # TOOD 3.5 blur ~ as upscaler controlnet nidek~  but community say it`s bad`
+
+        # TODO progress Upscaler
+
 
 
